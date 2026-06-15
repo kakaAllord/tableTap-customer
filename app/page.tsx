@@ -1,9 +1,12 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { io, Socket } from "socket.io-client";
 import { config } from "@/lib/config";
 import Image from "next/image";
+import QrScanner from "./QrScanner";
+
+const TABLE_STORAGE_KEY = "tabletap_table";
 
 interface MenuItem {
   id: string;
@@ -12,6 +15,14 @@ interface MenuItem {
   category: string;
   image: string;
   description: string;
+}
+
+interface ServerOrder {
+  id: string;
+  tableId: number;
+  amount: number;
+  status: string;
+  totalAmount?: number;
 }
 
 export default function App() {
@@ -32,8 +43,33 @@ export default function App() {
   const [orderReadyMessage, setOrderReadyMessage] = useState<string | null>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
   const [myTableId, setMyTableId] = useState<number>(0);
+  const [showScanner, setShowScanner] = useState(false);
   const [inventoryState, setInventoryState] = useState<Record<string, boolean>>({});
   const [menuItems, setMenuItems] = useState<MenuItem[]>([]);
+
+  // Live mirror of the active table + full order list so socket handlers
+  // (registered once) always filter against the current table, even after a re-scan.
+  const tableIdRef = useRef(0);
+  const allOrdersRef = useRef<ServerOrder[]>([]);
+
+  const recomputeOrders = (tid: number) => {
+    setActiveOrders(
+      allOrdersRef.current.filter((o) => o.tableId === tid && o.status !== "served")
+    );
+  };
+
+  // Apply a table number scanned from a "TABLE-TAP:{n}" QR code (or restored from storage).
+  const applyTable = (tableNumber: number) => {
+    tableIdRef.current = tableNumber;
+    setMyTableId(tableNumber);
+    try {
+      sessionStorage.setItem(TABLE_STORAGE_KEY, String(tableNumber));
+    } catch {
+      /* sessionStorage may be unavailable; non-fatal */
+    }
+    recomputeOrders(tableNumber);
+    setShowScanner(false);
+  };
 
   // Splash screen timeout
   useEffect(() => {
@@ -45,22 +81,34 @@ export default function App() {
     };
   }, []);
 
+  // Restore a previously scanned table (e.g. after a refresh), otherwise prompt
+  // the customer to scan their table QR code before ordering.
+  useEffect(() => {
+    let restored = 0;
+    try {
+      const saved = sessionStorage.getItem(TABLE_STORAGE_KEY);
+      if (saved) restored = parseInt(saved, 10) || 0;
+    } catch {
+      /* ignore */
+    }
+    if (restored > 0) {
+      tableIdRef.current = restored;
+      setMyTableId(restored);
+    } else {
+      setShowScanner(true);
+    }
+  }, []);
+
   // Socket connection
   useEffect(() => {
-    const tid = Math.floor(Math.random() * 20) + 1;
-    setMyTableId(tid);
-
     const s = io(config.apiUrl);
     setSocket(s);
 
     s.on("initial_state", (data) => {
       setInventoryState(data.inventoryState || {});
       setMenuItems(data.menu || []);
-      setActiveOrders(
-        (data.orders || []).filter(
-          (o: any) => o.tableId === tid && o.status !== "served"
-        )
-      );
+      allOrdersRef.current = data.orders || [];
+      recomputeOrders(tableIdRef.current);
     });
 
     s.on("inventory_update", (data) => {
@@ -68,13 +116,12 @@ export default function App() {
     });
 
     s.on("orders_update", (orders) => {
-      setActiveOrders(
-        orders.filter((o: any) => o.tableId === tid && o.status !== "served")
-      );
+      allOrdersRef.current = orders || [];
+      recomputeOrders(tableIdRef.current);
     });
 
     s.on("order_ready_notification", (data: { tableId: number; orderId: string }) => {
-      if (data.tableId === tid) {
+      if (data.tableId === tableIdRef.current) {
         setOrderReadyMessage(
           "🎉 Wonderful news! Your order has been freshly prepared and is on its way to your table. Sit tight and enjoy!"
         );
@@ -85,6 +132,7 @@ export default function App() {
     return () => {
       s.disconnect();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const cartItemCount = Object.values(cart).reduce((a, b) => a + b, 0);
@@ -188,6 +236,15 @@ export default function App() {
         </div>
       )}
 
+      {/* ── QR Scanner ── */}
+      {showScanner && (
+        <QrScanner
+          onScan={applyTable}
+          // Only allow cancelling if a table is already set (i.e. a re-scan).
+          onCancel={myTableId > 0 ? () => setShowScanner(false) : undefined}
+        />
+      )}
+
       <div className="app-container">
         <header className="header">
           <div className="header-top">
@@ -202,7 +259,13 @@ export default function App() {
               />
             </div>
             <div className="title">TableTap Menu</div>
-            <span className="table-badge">Table {myTableId || "—"}</span>
+            <button
+              className="table-badge"
+              onClick={() => setShowScanner(true)}
+              title="Switched tables? Tap to re-scan a QR code."
+            >
+              Table {myTableId || "—"} <span className="table-badge-rescan">⟳</span>
+            </button>
           </div>
           <div className="tabs">
             <div onClick={() => setActiveTab("dishes")} className={`tab ${activeTab === "dishes" ? "active" : ""}`}>Dishes</div>
